@@ -1,0 +1,206 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import cv2
+import numpy as np
+import base64
+import psycopg2
+from contextlib import contextmanager
+import logging
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+app = FastAPI()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+}
+
+@contextmanager
+def get_db_connection():
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        yield conn
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Database error: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+class SelfieRequest(BaseModel):
+    email: str
+    imageData: str
+    groupId: int
+
+@app.post("/validate-selfie")
+async def validate_selfie(request: SelfieRequest):
+    """
+    Validates selfie and stores image bytes in database
+    """
+    try:
+        # Decode base64 image
+        image_data = request.imageData
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        
+        img_bytes = base64.b64decode(image_data)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            return JSONResponse(
+                status_code=400,
+                content={"valid": False, "error": "Invalid image format"}
+            )
+        
+        # Basic validations using Haar Cascade (fast)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+        
+        if len(faces) == 0:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "error": "No face detected. Please ensure your face is clearly visible."
+                }
+            )
+        elif len(faces) > 1:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "error": f"Multiple faces detected ({len(faces)}). Only one person should be in the frame."
+                }
+            )
+        
+        # Quality checks
+        x, y, w, h = faces[0]
+        face_area = w * h
+        img_area = img.shape[0] * img.shape[1]
+        face_ratio = face_area / img_area
+        
+        if face_ratio < 0.15:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "error": "Face is too small. Please move closer to the camera."
+                }
+            )
+        
+        # Blur detection
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        print(f"getting blurry ness at {laplacian_var}")
+        if laplacian_var < 10:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "error": "Image is too blurry. Please ensure good lighting and focus."
+                }
+            )
+        
+        # Store in database
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    # Check if user exists
+                    cur.execute("SELECT id, groups, un_matched_groups FROM users WHERE email = %s", (request.email,))
+                    user = cur.fetchone()
+                    
+                    if not user:
+                        return JSONResponse(
+                            status_code=404,
+                            content={
+                                "valid": False,
+                                "error": "User not found with this email"
+                            }
+                        )
+                    
+                    user_id, current_groups, current_unmatched = user
+                    
+                    # Update groups and un_matched_groups arrays
+                    new_groups = list(set((current_groups or []) + [request.groupId]))
+                    new_unmatched = list(set((current_unmatched or []) + [request.groupId]))
+                    
+                    # Update user with image bytes and group info
+                    cur.execute(
+                        """
+                        UPDATE users 
+                        SET face_image_bytes = %s,
+                            groups = %s,
+                            un_matched_groups = %s,
+                            face_updated_at = NOW()
+                        WHERE email = %s
+                        """,
+                        (img_bytes, new_groups, new_unmatched, request.email)
+                    )
+                    conn.commit()
+                    
+                    logger.info(f"Face image stored for user: {request.email}, group: {request.groupId}")
+                    
+        except Exception as db_error:
+            logger.error(f"Database error: {db_error}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "valid": False,
+                    "error": "Failed to store face image in database"
+                }
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "valid": True,
+                "message": "Selfie validated and stored successfully",
+                "face_detected": True,
+                "face_coordinates": {
+                    "x": int(x),
+                    "y": int(y),
+                    "width": int(w),
+                    "height": int(h)
+                }
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in validate_selfie: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"valid": False, "error": f"Server error: {str(e)}"}
+        )
+
+@app.get("/")
+async def root():
+    return {"message": "Selfie Validation API", "status": "running"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
