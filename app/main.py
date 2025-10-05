@@ -54,12 +54,11 @@ def get_db_connection():
 class SelfieRequest(BaseModel):
     email: str
     imageData: str
-    groupId: int
 
 @app.post("/validate-selfie")
 async def validate_selfie(request: SelfieRequest):
     """
-    Validates selfie and stores image bytes in database
+    Validates selfie, stores image bytes, and adds all group IDs to un_matched_groups
     """
     try:
         # Decode base64 image
@@ -77,7 +76,7 @@ async def validate_selfie(request: SelfieRequest):
                 content={"valid": False, "error": "Invalid image format"}
             )
         
-        # Basic validations using Haar Cascade (fast)
+        # Basic validations using Haar Cascade
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
@@ -116,7 +115,8 @@ async def validate_selfie(request: SelfieRequest):
         
         # Blur detection
         laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        print(f"getting blurry ness at {laplacian_var}")
+        logger.info(f"Blur metric (Laplacian variance): {laplacian_var}")
+        
         if laplacian_var < 10:
             return JSONResponse(
                 status_code=400,
@@ -126,12 +126,12 @@ async def validate_selfie(request: SelfieRequest):
                 }
             )
         
-        # Store in database
+        # Store in database and update groups
         try:
             with get_db_connection() as conn:
                 with conn.cursor() as cur:
-                    # Check if user exists
-                    cur.execute("SELECT id, groups, un_matched_groups FROM users WHERE email = %s", (request.email,))
+                    # Check if user exists and get their current groups
+                    cur.execute("SELECT id, groups FROM users WHERE email = %s", (request.email,))
                     user = cur.fetchone()
                     
                     if not user:
@@ -143,27 +143,26 @@ async def validate_selfie(request: SelfieRequest):
                             }
                         )
                     
-                    user_id, current_groups, current_unmatched = user
+                    user_id = user[0]
+                    user_groups = user[1] if user[1] else []
                     
-                    # Update groups and un_matched_groups arrays
-                    new_groups = list(set((current_groups or []) + [request.groupId]))
-                    new_unmatched = list(set((current_unmatched or []) + [request.groupId]))
+                    logger.info(f"User {request.email} has {len(user_groups)} existing groups")
                     
-                    # Update user with image bytes and group info
+                    # Update user with image bytes and set un_matched_groups to their existing groups
                     cur.execute(
                         """
                         UPDATE users 
                         SET face_image_bytes = %s,
-                            groups = %s,
                             un_matched_groups = %s,
                             face_updated_at = NOW()
                         WHERE email = %s
                         """,
-                        (img_bytes, new_groups, new_unmatched, request.email)
+                        (img_bytes, user_groups, request.email)
                     )
                     conn.commit()
                     
-                    logger.info(f"Face image stored for user: {request.email}, group: {request.groupId}")
+                    logger.info(f"Face image stored for user: {request.email}")
+                    logger.info(f"Set un_matched_groups to user's existing {len(user_groups)} groups")
                     
         except Exception as db_error:
             logger.error(f"Database error: {db_error}")
@@ -181,6 +180,7 @@ async def validate_selfie(request: SelfieRequest):
                 "valid": True,
                 "message": "Selfie validated and stored successfully",
                 "face_detected": True,
+                "groups_added": len(user_groups),
                 "face_coordinates": {
                     "x": int(x),
                     "y": int(y),
